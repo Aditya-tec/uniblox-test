@@ -13,6 +13,15 @@
 I exercise all four with real concurrent threads in `backend/tests/test_concurrency.py`,
 asserting on final DB state rather than just HTTP response codes.
 
+## Payment
+
+I treat a successfully created `Order` as payment success. There is no payment
+step, gateway, or fake abstraction anywhere in the system — checkout's job per the
+spec is inventory and pricing correctness, not payment processing, and
+introducing a fake payment step would add a failure mode (what happens if the
+"payment" fails after inventory is already decremented?) that the spec never asks
+me to solve.
+
 ## Ambiguities and Chosen Semantics
 
 | Ambiguity | Decision | Reasoning |
