@@ -1,0 +1,417 @@
+### Reliable Checkout & Rewards Service — executable API examples
+###
+### Run top-to-bottom against a FRESHLY SEEDED instance (N=5, X=10 defaults):
+###   cd backend && rm -f app.db* && python -m app.seed && uvicorn app.main:app --port 8000
+###
+### This file is a single continuous script: later requests depend on state
+### created by earlier ones (e.g. reaching 5 successful orders before the
+### milestone coupon can be generated). Every request that captures a value
+### for later use is named with "# @name" and referenced as
+### {{name.response.body.$.field}} — this is the chaining syntax used by the
+### "REST Client" VS Code extension (humao.rest-client) and IntelliJ's HTTP
+### client. If your tool doesn't support chaining, just read each response as
+### you go and paste the id/code into the next request manually — the file
+### still works as a step-by-step reference either way.
+###
+### Verified end-to-end against the running backend before being committed:
+### every status code and error code below was captured from a real run,
+### not hand-typed.
+
+@baseUrl = http://localhost:8000
+
+### ============================================================
+### 1. HAPPY PATH — create cart, add item, view cart, checkout, get order
+### ============================================================
+
+# Create an empty cart. -> 201, empty items, subtotal "0.00"
+# @name cart1
+POST {{baseUrl}}/carts
+
+###
+
+# Add 2x Widget (product_id=1, ₹199.00 each) to the cart. -> 201, subtotal "398.00"
+POST {{baseUrl}}/carts/{{cart1.response.body.$.cart_id}}/items
+Content-Type: application/json
+
+{
+  "product_id": 1,
+  "quantity": 2
+}
+
+###
+
+# View the cart — always shows LIVE current prices, never a stale snapshot. -> 200
+GET {{baseUrl}}/carts/{{cart1.response.body.$.cart_id}}
+
+###
+
+# Checkout with no coupon. First success on this cart -> 201, total == subtotal.
+# @name cart1Checkout
+POST {{baseUrl}}/carts/{{cart1.response.body.$.cart_id}}/checkout
+Content-Type: application/json
+
+{}
+
+###
+
+# Fetch the order back. Demonstrates the order retains its own price/name
+# snapshot independent of the live product catalog. -> 200
+GET {{baseUrl}}/orders/{{cart1Checkout.response.body.$.order_id}}
+
+### ============================================================
+### 2. ERROR CASES — one request per error code in errors.py
+### ============================================================
+
+# CART_NOT_FOUND (404) — a cart id that was never created (or already GC'd).
+GET {{baseUrl}}/carts/00000000-0000-0000-0000-000000000000
+
+###
+
+# @name cart2
+POST {{baseUrl}}/carts
+
+###
+
+# PRODUCT_NOT_FOUND (404) — product_id doesn't exist.
+POST {{baseUrl}}/carts/{{cart2.response.body.$.cart_id}}/items
+Content-Type: application/json
+
+{
+  "product_id": 999999,
+  "quantity": 1
+}
+
+###
+
+# INVALID_QUANTITY (400) — quantity <= 0. Distinct from VALIDATION_ERROR (422):
+# this is a business-rule rejection, not a schema-shape rejection.
+POST {{baseUrl}}/carts/{{cart2.response.body.$.cart_id}}/items
+Content-Type: application/json
+
+{
+  "product_id": 1,
+  "quantity": 0
+}
+
+###
+
+# CART_ITEM_NOT_FOUND (404) — item_id doesn't exist on this cart.
+PATCH {{baseUrl}}/carts/{{cart2.response.body.$.cart_id}}/items/999999
+Content-Type: application/json
+
+{
+  "quantity": 1
+}
+
+###
+
+# CART_ALREADY_CHECKED_OUT (409) — mutating cart1, which was already checked
+# out in section 1. Any cart mutation (add/update/remove item) after checkout
+# gets this, not a generic error.
+POST {{baseUrl}}/carts/{{cart1.response.body.$.cart_id}}/items
+Content-Type: application/json
+
+{
+  "product_id": 2,
+  "quantity": 1
+}
+
+###
+
+# @name cart3
+POST {{baseUrl}}/carts
+
+###
+
+# CART_EMPTY (409) — checkout attempted on a cart with zero items.
+POST {{baseUrl}}/carts/{{cart3.response.body.$.cart_id}}/checkout
+Content-Type: application/json
+
+{}
+
+###
+
+# @name cart4
+POST {{baseUrl}}/carts
+
+###
+
+# Doohickey (product_id=4) is seeded with inventory=3 specifically to make
+# this demonstrable. Adding 10 succeeds (cart mutation doesn't check stock)...
+POST {{baseUrl}}/carts/{{cart4.response.body.$.cart_id}}/items
+Content-Type: application/json
+
+{
+  "product_id": 4,
+  "quantity": 10
+}
+
+###
+
+# ...but INSUFFICIENT_INVENTORY (409) fires at checkout, with the actual
+# available count in error.details.available. Inventory is left untouched
+# (verify with GET /products/4 — still shows inventory: 3).
+POST {{baseUrl}}/carts/{{cart4.response.body.$.cart_id}}/checkout
+Content-Type: application/json
+
+{}
+
+###
+
+# ORDER_NOT_FOUND (404) — an order id that doesn't exist.
+GET {{baseUrl}}/orders/00000000-0000-0000-0000-000000000000
+
+### ============================================================
+### 3. MILESTONE — not-yet-eligible before enough orders exist
+### ============================================================
+
+# MILESTONE_NOT_YET_ELIGIBLE (409) — only 1 successful order exists so far
+# (from section 1), but N=5 are required for milestone #1. error.details
+# shows { current_orders, required_orders, next_milestone }.
+POST {{baseUrl}}/admin/coupons/generate
+
+### ============================================================
+### 4. IDEMPOTENCY — dual layer: Idempotency-Key header + cart-state
+### ============================================================
+
+# @name cart5
+POST {{baseUrl}}/carts
+
+###
+
+POST {{baseUrl}}/carts/{{cart5.response.body.$.cart_id}}/items
+Content-Type: application/json
+
+{
+  "product_id": 3,
+  "quantity": 1
+}
+
+###
+
+# First checkout with an Idempotency-Key. -> 201 (a new order is created).
+# @name cart5Checkout
+POST {{baseUrl}}/carts/{{cart5.response.body.$.cart_id}}/checkout
+Content-Type: application/json
+Idempotency-Key: demo-key-1
+
+{}
+
+###
+
+# Replaying the SAME Idempotency-Key against the SAME cart returns the
+# stored response verbatim — still 201 (not re-executed), byte-for-byte
+# identical body to the request above, and inventory is decremented only
+# once (verify with GET /products/3).
+POST {{baseUrl}}/carts/{{cart5.response.body.$.cart_id}}/checkout
+Content-Type: application/json
+Idempotency-Key: demo-key-1
+
+{}
+
+###
+
+# Retrying with NO Idempotency-Key against an already-CHECKED_OUT cart hits
+# the other idempotency layer (cart-state): it replays the same order but
+# with 200, not 201, since no new resource was created by this call.
+POST {{baseUrl}}/carts/{{cart5.response.body.$.cart_id}}/checkout
+Content-Type: application/json
+
+{}
+
+###
+
+# @name cart6
+POST {{baseUrl}}/carts
+
+###
+
+POST {{baseUrl}}/carts/{{cart6.response.body.$.cart_id}}/items
+Content-Type: application/json
+
+{
+  "product_id": 3,
+  "quantity": 1
+}
+
+###
+
+# IDEMPOTENCY_KEY_CONFLICT (409) — reusing "demo-key-1" for a DIFFERENT cart
+# than the one it was first used for. This is client misuse (reusing a key
+# across unrelated requests), not a retry, so cart6 is untouched — it stays
+# OPEN and this call creates no order.
+POST {{baseUrl}}/carts/{{cart6.response.body.$.cart_id}}/checkout
+Content-Type: application/json
+Idempotency-Key: demo-key-1
+
+{}
+
+### ============================================================
+### 5. ADMIN FLOW — reach the milestone, generate, redeem, view the report
+### ============================================================
+
+# Three more quick orders to bring the running total to 5 successful orders
+# (1 from section 1 + 1 from section 4's idempotency demo + these 3).
+
+# @name filler1
+POST {{baseUrl}}/carts
+
+###
+
+POST {{baseUrl}}/carts/{{filler1.response.body.$.cart_id}}/items
+Content-Type: application/json
+
+{
+  "product_id": 3,
+  "quantity": 1
+}
+
+###
+
+POST {{baseUrl}}/carts/{{filler1.response.body.$.cart_id}}/checkout
+Content-Type: application/json
+
+{}
+
+###
+
+# @name filler2
+POST {{baseUrl}}/carts
+
+###
+
+POST {{baseUrl}}/carts/{{filler2.response.body.$.cart_id}}/items
+Content-Type: application/json
+
+{
+  "product_id": 3,
+  "quantity": 1
+}
+
+###
+
+POST {{baseUrl}}/carts/{{filler2.response.body.$.cart_id}}/checkout
+Content-Type: application/json
+
+{}
+
+###
+
+# @name filler3
+POST {{baseUrl}}/carts
+
+###
+
+POST {{baseUrl}}/carts/{{filler3.response.body.$.cart_id}}/items
+Content-Type: application/json
+
+{
+  "product_id": 3,
+  "quantity": 1
+}
+
+###
+
+POST {{baseUrl}}/carts/{{filler3.response.body.$.cart_id}}/checkout
+Content-Type: application/json
+
+{}
+
+###
+
+# Now at exactly 5 successful orders -> milestone #1 is reached. -> 201,
+# a coupon like "SAVE10-XXXXXX" with discount_percent=10 (X=10 default).
+# @name coupon
+POST {{baseUrl}}/admin/coupons/generate
+
+###
+
+# Calling generate again IMMEDIATELY -> MILESTONE_NOT_YET_ELIGIBLE (409)
+# again, this time for milestone #2 (needs 10 total orders, only 5 exist).
+POST {{baseUrl}}/admin/coupons/generate
+
+###
+
+# Admin report: pure read, no side effects. Calling it again with no new
+# orders in between returns byte-for-byte the same body (see
+# test_report_stable_across_repeated_calls). net_revenue always reconciles
+# to gross_revenue - total_discount.
+GET {{baseUrl}}/admin/report
+
+###
+
+# COUPON_NOT_FOUND (400) — a coupon code that was never generated.
+# @name cart7
+POST {{baseUrl}}/carts
+
+###
+
+POST {{baseUrl}}/carts/{{cart7.response.body.$.cart_id}}/items
+Content-Type: application/json
+
+{
+  "product_id": 3,
+  "quantity": 1
+}
+
+###
+
+POST {{baseUrl}}/carts/{{cart7.response.body.$.cart_id}}/checkout
+Content-Type: application/json
+
+{
+  "coupon_code": "NOPE-000000"
+}
+
+###
+
+# @name cart8
+POST {{baseUrl}}/carts
+
+###
+
+POST {{baseUrl}}/carts/{{cart8.response.body.$.cart_id}}/items
+Content-Type: application/json
+
+{
+  "product_id": 3,
+  "quantity": 1
+}
+
+###
+
+# Redeem the real coupon from above -> 201, discount = 10% of the subtotal,
+# coupon_code echoed back in the response.
+POST {{baseUrl}}/carts/{{cart8.response.body.$.cart_id}}/checkout
+Content-Type: application/json
+
+{
+  "coupon_code": "{{coupon.response.body.$.code}}"
+}
+
+###
+
+# @name cart9
+POST {{baseUrl}}/carts
+
+###
+
+POST {{baseUrl}}/carts/{{cart9.response.body.$.cart_id}}/items
+Content-Type: application/json
+
+{
+  "product_id": 3,
+  "quantity": 1
+}
+
+###
+
+# COUPON_ALREADY_REDEEMED (409) — same coupon code, a different cart, after
+# it was already spent above. Note this is a DIFFERENT error from
+# COUPON_NOT_FOUND: the code is real, it's just gone.
+POST {{baseUrl}}/carts/{{cart9.response.body.$.cart_id}}/checkout
+Content-Type: application/json
+
+{
+  "coupon_code": "{{coupon.response.body.$.code}}"
+}
