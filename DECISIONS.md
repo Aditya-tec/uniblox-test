@@ -285,10 +285,24 @@ bug.
 
 ## Time Spent
 
-I spent a single focused working session on this: roughly 45 minutes directing
-and reviewing schema/models/config, 90 minutes on the checkout transaction and
-services layer (including tracking down and directing the fix for the
-idempotency-key race), 45 minutes on coupons/report, 45 minutes on the test suite
-(unit + integration + concurrency), 60 minutes on the frontend, and 30 minutes
-manually testing the full app in a browser against the live backend myself — which
-is where I actually found both bugs documented above — plus writing this document.
+I spent a single focused working session on the original build: roughly 45 minutes
+directing and reviewing schema/models/config, 90 minutes on the checkout
+transaction and services layer (including tracking down and directing the fix for
+the idempotency-key race), 45 minutes on coupons/report, 45 minutes on the test
+suite (unit + integration + concurrency), 60 minutes on the frontend, and 30
+minutes manually testing the full app in a browser against the live backend
+myself — which is where I actually found both bugs documented above — plus
+writing this document.
+
+**Follow-up session (post-submission polish), roughly 90 minutes total:**
+rewriting this document's voice to first-person engineering reasoning while
+verifying no technical fact changed (~20 minutes); building `examples.http` and
+writing a throwaway verification script to run every example against the live
+backend before committing it, rather than hand-typing expected responses
+(~30 minutes); setting up the GitHub Actions CI workflow, running the exact
+lint/format/test commands locally first, then confirming the actual run went
+green via the GitHub API and fetching the badge SVG directly to confirm it
+rendered "passing" rather than assuming (~25 minutes); and adding a
+`python-dotenv` loader so `backend/.env` is actually read (the README had
+instructed copying `.env.example` to `.env`, but nothing previously loaded it),
+verified with a real test `.env` file and a full test-suite re-run (~10 minutes).
