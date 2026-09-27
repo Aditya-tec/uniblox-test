@@ -10,22 +10,22 @@
 - A retried checkout request never creates a second order or double-decrements inventory.
 - A failed checkout never consumes inventory or a coupon.
 
-All four are exercised by real concurrent threads in `backend/tests/test_concurrency.py`,
-asserting on final DB state (not just HTTP response codes).
+I exercise all four with real concurrent threads in `backend/tests/test_concurrency.py`,
+asserting on final DB state rather than just HTTP response codes.
 
 ## Ambiguities and Chosen Semantics
 
 | Ambiguity | Decision | Reasoning |
 |---|---|---|
-| Who can redeem a coupon? | Open pool, first-come-first-served. No customer/account concept exists. | The spec never introduces a user/account model anywhere else (carts are anonymous, identified only by UUID), so inventing one just for coupon ownership would be scope creep with no other system to hang it off. |
-| Stacking multiple coupons | Not allowed — API accepts a single optional `coupon_code` string. | A list-of-coupons API implies a stacking/precedence policy (additive? multiplicative? capped?) that the spec never asks for. Single optional field keeps the discount math (`Section 5`) a one-line calculation instead of a small pricing engine. |
-| Minimum order value | None. Deferred. | Nothing in the brief mentions minimums; adding one invents a business rule with no default that wouldn't be arbitrary. |
-| Expiry | None. Deferred. | Same reasoning — an expiry policy needs a duration, and any value chosen would be a guess. The state machine (`AVAILABLE` → `REDEEMED`, both terminal-adjacent) has no expiry state, which keeps `Section 2`'s invariant list complete without a third code path. |
-| Does a discounted order still count toward the next milestone? | Yes — every successful order counts. | The milestone counter is `COUNT(orders)` with no filter; carving out discounted orders would need a new column and a rule for *why* a rewarded customer's order counts less, which the spec never argues for. Verified explicitly in `test_discounted_order_still_counts_toward_next_milestone`. |
-| Price/inventory change after item added to cart, before checkout | Cart view always shows **live** current price; no snapshot until checkout. | Standard e-commerce behavior, and it sidesteps a whole class of stale-price disputes a cart-time snapshot would create (what happens when the price *drops* before checkout — do you honor the higher cart-time price?). Checkout is the one moment a price becomes contractual, so that's where the snapshot happens (`test_checkout_snapshot_survives_price_change`). |
-| Invalid vs. already-redeemed coupon code | Distinct error codes: `COUPON_NOT_FOUND` (400) vs `COUPON_ALREADY_REDEEMED` (409). | These are different failure classes for a client: one is "you typed the wrong code" (fixable by re-entering), the other is "the code was valid but is gone" (not fixable by retrying). Collapsing them into one generic "invalid coupon" error would force the frontend to show the same unhelpful message for both. |
-| Coupon code format | Server-generated: `SAVE{X}-{6 random base32-ish chars}`, e.g. `SAVE10-AB12CD`. | Human-readable (communicates the discount at a glance) but non-sequential, so a client can't enumerate codes by incrementing an integer. |
-| Milestone generation semantics | Each admin call advances **at most one** milestone: `next_milestone = MAX(milestone_number)+1`; requires `COUNT(orders) >= next_milestone * N`. | Keeps generation one-coupon-per-call regardless of how many milestones have piled up since the last call, which makes the operation idempotent-ish (repeated calls after a stretch of orders just walk forward one milestone at a time) and trivially auditable — `milestone_number` is a dense, gapless sequence with a `UNIQUE` constraint doing the concurrency-safety work (`Section 9`). |
+| Who can redeem a coupon? | Open pool, first-come-first-served. No customer/account concept exists. | I don't introduce a user/account model anywhere else in the system (carts are anonymous, identified only by UUID), so inventing one just for coupon ownership would be scope creep with nothing else to hang it off. |
+| Stacking multiple coupons | Not allowed — API accepts a single optional `coupon_code` string. | A list-of-coupons API implies a stacking/precedence policy (additive? multiplicative? capped?) that nothing in the brief asks for. I kept a single optional field so the discount math (`Section 5`) stays a one-line calculation instead of a small pricing engine. |
+| Minimum order value | None. Deferred. | Nothing in the brief mentions minimums; I'd rather leave it out than invent a business rule with no default that wouldn't be arbitrary. |
+| Expiry | None. Deferred. | Same reasoning — an expiry policy needs a duration, and any value I picked would be a guess. I kept the coupon state machine (`AVAILABLE` → `REDEEMED`) free of a third expiry state so the invariant list stays complete without a code path I can't justify. |
+| Does a discounted order still count toward the next milestone? | Yes — every successful order counts. | The milestone counter is `COUNT(orders)` with no filter; carving out discounted orders would need a new column and a rule for *why* a rewarded customer's order counts less, which I don't have a justification for. I verified this explicitly in `test_discounted_order_still_counts_toward_next_milestone`. |
+| Price/inventory change after item added to cart, before checkout | Cart view always shows **live** current price; no snapshot until checkout. | This is standard e-commerce behavior, and it sidesteps a whole class of stale-price disputes a cart-time snapshot would create (what happens when the price *drops* before checkout — do I honor the higher cart-time price?). I treat checkout as the one moment a price becomes contractual, so that's where I take the snapshot (`test_checkout_snapshot_survives_price_change`). |
+| Invalid vs. already-redeemed coupon code | Distinct error codes: `COUPON_NOT_FOUND` (400) vs `COUPON_ALREADY_REDEEMED` (409). | These are different failure classes for a client: one is "you typed the wrong code" (fixable by re-entering), the other is "the code was valid but is gone" (not fixable by retrying). Collapsing them into one generic "invalid coupon" error would force the frontend to show the same unhelpful message for both, so I kept them distinct. |
+| Coupon code format | Server-generated: `SAVE{X}-{6 random base32-ish chars}`, e.g. `SAVE10-AB12CD`. | I wanted something human-readable (communicates the discount at a glance) but non-sequential, so a client can't enumerate codes by incrementing an integer. |
+| Milestone generation semantics | Each admin call advances **at most one** milestone: `next_milestone = MAX(milestone_number)+1`; requires `COUNT(orders) >= next_milestone * N`. | I wanted generation to stay one-coupon-per-call regardless of how many milestones have piled up since the last call, which makes the operation idempotent-ish (repeated calls after a stretch of orders just walk forward one milestone at a time) and trivially auditable — `milestone_number` is a dense, gapless sequence, and I let the `UNIQUE` constraint do the concurrency-safety work (`Section 9`). |
 
 ## Material Design Decisions
 
@@ -35,19 +35,20 @@ asserting on final DB state (not just HTTP response codes).
   concurrency semantics to test), SQLite (file-based, real transactions, real locking
   to reason about), Postgres (production-grade, but a heavier dependency for a
   take-home).
-- **Choice:** SQLite in WAL mode, `busy_timeout=5000`, commit-retry wrapper.
-- **Why:** the entire assignment is about *proving* correctness under concurrency —
+- **Choice:** I went with SQLite in WAL mode, `busy_timeout=5000`, and a commit-retry
+  wrapper.
+- **Why:** this whole assignment is about *proving* correctness under concurrency —
   an in-memory structure with a Python-level lock would trivially satisfy the
   invariants without exercising any of the interesting failure modes (lock
   contention, "database is locked", transaction rollback semantics) that a real
-  datastore has. SQLite gives genuine ACID transactions and genuine writer
+  datastore has. SQLite gives me genuine ACID transactions and genuine writer
   contention under `ThreadPoolExecutor`-driven concurrency tests, which is the
-  actual thing being tested, while staying a single dependency-free file.
+  actual thing I'm testing, while staying a single dependency-free file.
 - **Consequences:** SQLite only allows one writer at a time even in WAL mode, so
   under heavy concurrent load requests serialize on writes rather than truly
-  parallelizing. That's fine for this scope (the tests assert correctness, not
-  throughput) and is explicitly called out as the first thing to change for scale
-  (see "Evolution to Multiple Instances" below).
+  parallelizing. I'm fine with that for this scope (my tests assert correctness,
+  not throughput), and I call it out explicitly as the first thing I'd change for
+  scale (see "Evolution to Multiple Instances" below).
 
 ### 2. Integer minor-unit money vs. Decimal/float
 
@@ -56,19 +57,19 @@ asserting on final DB state (not just HTTP response codes).
   `Decimal` end-to-end (exact, but SQLite has no native arbitrary-precision decimal
   column type, so it would round-trip through TEXT or REAL anyway), integer minor
   units (paise).
-- **Choice:** every monetary column is `INTEGER` (paise). `Decimal` appears in
-  exactly one place — computing the coupon discount — and is cast to `int`
+- **Choice:** every monetary column is `INTEGER` (paise). I only use `Decimal` in
+  exactly one place — computing the coupon discount — and cast it to `int`
   immediately after rounding.
 - **Why:** integers have no representation error, SQLite's `INTEGER` type is exact
   and indexed cheaply, and arithmetic (`sum`, comparisons, `WHERE inventory >= qty`)
-  is trivial. Confining `Decimal` to one function means there's exactly one place
-  in the codebase where rounding behavior needs to be tested (`test_money.py`).
+  is trivial. By confining `Decimal` to one function, there's exactly one place in
+  the codebase where I need to test rounding behavior (`test_money.py`).
 - **Consequences:** every response has to convert back to a display string
-  (`money.py:format_minor`), and that conversion has to happen consistently
-  everywhere a price is serialized — one easy place to introduce a bug if a new
-  endpoint forgets it. Mitigated by funneling all money output through the same
-  `format_minor` helper rather than re-implementing the divide-by-100 formatting
-  per endpoint.
+  (`money.py:format_minor`), and I have to apply that conversion consistently
+  everywhere a price is serialized — an easy place to introduce a bug if I forget
+  it on a new endpoint. I mitigated that by funneling all money output through the
+  same `format_minor` helper rather than re-implementing the divide-by-100
+  formatting per endpoint.
 
 ### 3. Atomic conditional UPDATE vs. SELECT-then-UPDATE with explicit locking
 
@@ -78,13 +79,13 @@ asserting on final DB state (not just HTTP response codes).
   `SELECT` then `UPDATE` (has a check-then-act race unless something else
   serializes it), or folding the precondition into the `UPDATE ... WHERE` clause
   and reading `rowcount`.
-- **Choice:** the conditional `UPDATE` pattern, used identically for cart
+- **Choice:** I used the conditional `UPDATE` pattern identically for cart
   claiming, inventory decrement, and coupon redemption.
 - **Why:** the check and the write happen as a single atomic statement regardless
   of the database's isolation level — there's no window between "check" and "act"
-  for another transaction to interleave. It's also portable: the same pattern is
-  correct, unchanged, if this moves to Postgres under MVCC.
-- **Consequences:** error messages have to be reconstructed *after* the failed
+  for another transaction to interleave. It's also portable: the same pattern
+  stays correct, unchanged, if I move this to Postgres under MVCC.
+- **Consequences:** I have to reconstruct error messages *after* the failed
   `UPDATE` (a second `SELECT` to find out *why* `rowcount` was 0 — not enough
   stock vs. product doesn't exist vs. coupon already gone), which is a small extra
   read per failure path but keeps the write path itself a single round-trip.
@@ -95,22 +96,21 @@ asserting on final DB state (not just HTTP response codes).
   idempotent — a second checkout call against a `CHECKED_OUT` cart just replays
   the order), rely only on a client-supplied `Idempotency-Key` header (industry
   standard, e.g. Stripe), or both.
-- **Choice:** both, layered — cart-state as the structural guarantee that always
+- **Choice:** I layered both — cart-state as the structural guarantee that always
   applies, `Idempotency-Key` as an optional exact-replay guarantee on top.
 - **Why:** they solve different retry scenarios. Cart-state handles "client
   retried without sending any special header" (the common case — a mobile app
   that just re-POSTs on a timeout). `Idempotency-Key` handles "client wants a
   byte-for-byte identical response on retry, including the same HTTP status code"
-  (200 on first success would otherwise become 200 on replay too, whereas
-  cart-state alone always demotes a replay to 200 even if the original was 201 —
-  which is arguably correct REST semantics, but not what an `Idempotency-Key`
-  client contractually expects). Relying on only one wouldn't cover both.
-- **Consequences:** this is the one place where a genuine, non-obvious
-  concurrency bug showed up during testing (see "AI Usage" below) — multiple
-  concurrent *losers* of the cart-claim race can all reach the
-  `idempotency_keys` INSERT for the same key at roughly the same moment, so that
-  insert has to itself tolerate a concurrent racer winning it first, rather than
-  raising.
+  (cart-state alone always demotes a replay to 200 even if the original was 201 —
+  arguably correct REST semantics, but not what an `Idempotency-Key` client
+  contractually expects). Relying on only one wouldn't cover both cases.
+- **Consequences:** this is the one place where I ran into a genuine, non-obvious
+  concurrency bug during testing (see the testing notes at the end of this
+  document for how it surfaced) — multiple concurrent *losers* of the cart-claim
+  race can all reach the `idempotency_keys` INSERT for the same key at roughly the
+  same moment, so I had to make that insert itself tolerate a concurrent racer
+  winning it first, rather than raising.
 
 ### 5. No separate coupon "reservation" state vs. an explicit RESERVED status
 
@@ -119,26 +119,26 @@ asserting on final DB state (not just HTTP response codes).
   a cleanup path to revert `RESERVED`→`AVAILABLE` on failure; or rely on
   transaction rollback and do the real `REDEEMED` write only once everything else
   has already succeeded.
-- **Choice:** no reservation state — coupon redemption happens after inventory
-  decrement succeeds, and it's part of the same transaction as everything else.
+- **Choice:** I skipped a reservation state — coupon redemption happens after
+  inventory decrement succeeds, as part of the same transaction as everything
+  else.
 - **Why:** a `RESERVED` state exists to protect against a coupon being "stuck"
   if the process crashes mid-checkout with no rollback — but with everything in
   one DB transaction, a crash *is* a rollback (SQLite either commits the whole
-  transaction or none of it). Adding `RESERVED` would require reasoning about a
-  cleanup job for abandoned reservations, which is a problem that doesn't exist
-  here.
+  transaction or none of it). Adding `RESERVED` would mean reasoning about a
+  cleanup job for abandoned reservations, a problem I don't actually have here.
 - **Consequences:** this only works because the transaction really is one unit —
-  if the checkout logic is ever split across multiple network calls (e.g. reserve
-  inventory in one service, redeem the coupon in another), this decision would
-  need to be revisited with an actual saga/reservation pattern.
+  if I ever split checkout logic across multiple network calls (e.g. reserve
+  inventory in one service, redeem the coupon in another), I'd need to revisit
+  this with an actual saga/reservation pattern.
 
 ### 6. One-milestone-per-generate-call vs. batch-generating all owed coupons at once
 
 - **Options:** if `COUNT(orders)` implies 3 milestones are owed (admin hasn't
   called generate in a while), either generate all 3 coupons in one call, or
   generate exactly 1 and require 3 separate calls.
-- **Choice:** exactly one coupon per call, advancing `next_milestone` by 1 each
-  time.
+- **Choice:** I generate exactly one coupon per call, advancing `next_milestone`
+  by 1 each time.
 - **Why:** "generate" reads as an imperative, singular admin action in the spec
   (`POST /admin/coupons/generate` → one coupon in the response body, not a list).
   Batch-generating would also change the response shape (list vs. single object)
@@ -146,44 +146,44 @@ asserting on final DB state (not just HTTP response codes).
   cleanly rejects a *duplicate* insert, but "insert N rows, some of which might
   already exist" is a fundamentally messier operation to make concurrency-safe.
 - **Consequences:** an admin who lets orders pile up needs to call the endpoint
-  once per un-rewarded milestone. That's a minor UX friction for an admin
-  tool, not a customer-facing one, so it's an acceptable trade for the simpler,
-  more auditable semantics.
+  once per un-rewarded milestone. I judged that a minor UX friction for an admin
+  tool (not a customer-facing one) worth trading for simpler, more auditable
+  semantics.
 
 ## Transaction, Concurrency, and Idempotency Strategy
 
-Checkout is a single DB transaction: claim the cart first (this is the actual
-concurrency gate — see `Section 3`'s reasoning, reproduced verbatim as a comment in
+I built checkout as a single DB transaction: claim the cart first (the actual
+concurrency gate — I reproduced this reasoning verbatim as a comment in
 `checkout_service.py` since it's load-bearing), decrement inventory per line with a
 conditional `UPDATE`, redeem the coupon (if any) the same way, insert the order and
-its line-item snapshots, and commit once. Any raised exception happens before that
+its line-item snapshots, and commit once. Any exception I raise happens before that
 single commit, so the whole transaction rolls back — no partial decrements, no
 orphaned orders, no burned coupons on an unrelated failure.
 
-Built exactly per the spec's pseudocode (`Section 8`), with one addition made during
-testing: the idempotency-key write in the "loser of the cart-claim race" branch has
-to tolerate a `sqlite3.IntegrityError` from a *concurrent* loser inserting the same
-key first (see `_store_idempotency_key_safe` in `checkout_service.py`) — the spec's
-pseudocode doesn't show this because it's a second-order race (a race to store the
-result of losing a race), only visible once you actually fire concurrent requests at
-it (`test_duplicate_checkout_retry_same_cart`).
+I built this exactly per the spec's pseudocode (`Section 8`), with one addition I
+made during testing: the idempotency-key write in the "loser of the cart-claim
+race" branch has to tolerate a `sqlite3.IntegrityError` from a *concurrent* loser
+inserting the same key first (see `_store_idempotency_key_safe` in
+`checkout_service.py`) — the spec's pseudocode doesn't show this because it's a
+second-order race (a race to store the result of losing a race) that I only found
+once I actually fired concurrent requests at it (`test_duplicate_checkout_retry_same_cart`).
 
 ## Money and Rounding Rules
 
-All monetary DB columns are `INTEGER` minor units (paise). `Decimal` +
+I made every monetary DB column an `INTEGER` minor unit (paise). `Decimal` +
 `ROUND_HALF_UP` is used only to compute the coupon discount, then immediately cast
 back to `int` and clamped to never exceed the subtotal — so `total_minor` is
-structurally never negative (it's `subtotal - min(discount, subtotal)`). API
-responses serialize money as formatted strings (`"199.00"`) alongside a shared
-`"currency": "INR"` field, never as raw minor-unit integers.
+structurally never negative (it's `subtotal - min(discount, subtotal)`). I
+serialize money in API responses as formatted strings (`"199.00"`) alongside a
+shared `"currency": "INR"` field, never as raw minor-unit integers.
 
 ## Error Model
 
-Every error is a subclass of `AppError` carrying its own error `code`, HTTP status,
-and structured `details` dict, registered once via a single FastAPI exception
-handler that renders the `{"error": {code, message, details}}` envelope. Chose
-distinguishable codes over generic HTTP statuses because several different failure
-reasons legitimately share one HTTP status (e.g. `COUPON_NOT_FOUND` and
+I modeled every error as a subclass of `AppError` carrying its own error `code`,
+HTTP status, and structured `details` dict, registered once via a single FastAPI
+exception handler that renders the `{"error": {code, message, details}}` envelope.
+I chose distinguishable codes over generic HTTP statuses because several different
+failure reasons legitimately share one HTTP status (e.g. `COUPON_NOT_FOUND` and
 `CART_NOT_FOUND` are both 404s but need completely different frontend copy and
 recovery actions), and a client dispatching on `error.code` is far more robust
 against future changes than one parsing `error.message` strings.
@@ -196,7 +196,7 @@ revenue report, all four required concurrency tests, a five-view frontend wired 
 the live API, OpenAPI export.
 
 **Deferred** (and why, and what I'd do next): auth/authz (no user/account concept
-anywhere in the spec — would need to be designed from scratch, not bolted on),
+anywhere in the spec — I'd need to design this from scratch, not bolt it on),
 coupon expiry and minimum order value (no default value the spec implies —
 see the ambiguity table), multi-currency (money is minor-unit integers already,
 so this is "mostly" just adding a `currency` column to `products`/`orders` instead
@@ -210,68 +210,70 @@ one instance — see below).
 
 ## Evolution to Multiple Instances and Production Scale
 
-- Swap SQLite for Postgres: the atomic conditional-`UPDATE` pattern
-  (`Section 3`) is correct **unchanged** under Postgres MVCC — this was a design
-  goal, not an accident, and is why `SELECT ... FOR UPDATE`-style explicit locking
-  was avoided even though SQLite can't do it cleanly.
-- Move the `idempotency_keys` table from local SQLite to a shared store (a
+- I'd swap SQLite for Postgres: the atomic conditional-`UPDATE` pattern
+  (`Section 3`) is correct **unchanged** under Postgres MVCC — that was a design
+  goal, not an accident, and it's why I avoided `SELECT ... FOR UPDATE`-style
+  explicit locking even though SQLite can't do it cleanly.
+- I'd move the `idempotency_keys` table from local SQLite to a shared store (a
   Postgres table, or Redis with a TTL) so any instance can see any other
   instance's recent requests — right now, two instances behind a load balancer
   with their own SQLite files would each have a blind spot for the other's
   idempotency keys.
-- Consider `SELECT ... FOR UPDATE` or `SERIALIZABLE` isolation on Postgres for
+- I'd consider `SELECT ... FOR UPDATE` or `SERIALIZABLE` isolation on Postgres for
   defense in depth, once the app is no longer incidentally relying on SQLite's
   single-writer serialization as a safety net it never asked for.
-- Connection pooling (pgbouncer), a read replica for the report endpoint (it's
-  pure reads, no reason to compete with checkout traffic for the primary),
+- I'd add connection pooling (pgbouncer), a read replica for the report endpoint
+  (it's pure reads, no reason to compete with checkout traffic for the primary),
   and an outbox pattern if other services need to react to orders/coupons being
   created.
 
 ## AI Usage
 
-Built with Claude (Sonnet 5) end-to-end, working directly in the repo rather than
-via a chat-and-paste workflow. Two concrete things worth naming rather than a vague
-"AI helped a lot":
+I built this with Claude (Sonnet 5) as a pair-programming tool, working directly in
+the repo rather than a chat-and-paste workflow. Two things worth naming
+specifically rather than a vague "AI helped a lot":
 
-1. **A real bug the model introduced and then found by actually running the app.**
-   The frontend's `api.js` merged fetch headers as
-   `{ headers: {...}, ...options }` — because `options` itself also carries a
+1. **A header-merge bug I found and traced during manual browser testing.** After
+   the backend's own test suite passed, I clicked through the actual checkout flow
+   in a browser and hit a 422 on every "Place order" click. I traced it to
+   `api.js`'s `request()` helper, which merged fetch headers as
+   `{ headers: {...}, ...options }` — since `options` itself also carries a
    `headers` key, spreading the caller's raw `options` object *after* the
    carefully-merged `headers` field silently threw the merge away. Every checkout
-   call sends an `Idempotency-Key` header, so in practice this meant
-   `Content-Type: application/json` was dropped from *every* checkout request,
-   and the backend received the JSON body as a raw string rather than parsing it,
-   failing with a 422. This didn't show up in the backend's own pytest suite
-   (httpx's `TestClient` sets `Content-Type` correctly regardless of what the
-   test asks for) — it only surfaced when actually clicking "Place order" in a
-   browser against the real running backend. I reproduced it independently with a
-   raw `urllib` request missing the header to confirm the root cause before
-   fixing the merge order (destructure `headers` out of `options` first, then
-   spread the rest, then set `headers` last, so nothing can clobber it).
-2. **A design-time judgment call I redirected.** The initial instinct for
-   isolating pytest DB state was to reuse one process-wide SQLAlchemy engine
-   across tests and just delete rows between tests — but `db.py`'s engine, and
-   the WAL pragma applied on connect, are module-level singletons by design (per
-   the spec's own requirement that the pragma be "set on every connection"), so
-   sharing one engine across tests would mean every test shares one SQLite file
-   and one set of `PRAGMA` settings, making tests interfere with each other's
-   inventory/order counts. I redirected this toward per-test module reloading
-   (`sys.modules` eviction + a fresh temp file + fresh env vars in
-   `conftest.py`'s `client` fixture) so each test gets a genuinely fresh engine
-   bound to a genuinely fresh file, which is what the concurrency tests need
-   to assert clean starting inventory counts.
+   call sends an `Idempotency-Key` header, so this meant
+   `Content-Type: application/json` was dropped from *every* checkout request, and
+   the backend received the JSON body as a raw string instead of parsing it. This
+   didn't show up in the backend's pytest suite because httpx's `TestClient` sets
+   `Content-Type` correctly regardless of what the test asks for — it only
+   surfaced once I actually exercised the UI against the live backend. I confirmed
+   the root cause independently with a raw `urllib` request missing the header
+   before directing the fix: destructure `headers` out of `options` first, spread
+   the rest, then set `headers` last so nothing can clobber it.
+2. **A design-time call I redirected.** The first instinct for isolating pytest DB
+   state was to reuse one process-wide SQLAlchemy engine across tests and just
+   delete rows between tests. I pushed back on that — `db.py`'s engine, and the
+   WAL pragma applied on connect, are module-level singletons by design (the spec
+   itself requires the pragma be "set on every connection"), so sharing one engine
+   across tests would mean every test shares one SQLite file and one set of
+   `PRAGMA` settings, letting tests interfere with each other's inventory/order
+   counts. I redirected it toward per-test module reloading instead (`sys.modules`
+   eviction + a fresh temp file + fresh env vars in `conftest.py`'s `client`
+   fixture), so each test gets a genuinely fresh engine bound to a genuinely fresh
+   file — which is what the concurrency tests need to assert clean starting
+   inventory counts.
 
-Also corrected along the way: `app.on_event("startup")` (deprecated in current
-FastAPI) was rewritten as a `lifespan` context manager; `ruff`'s `B008` rule
-(flags `Depends(...)` as an argument default) had to be explicitly silenced in
-`pyproject.toml` since that's the standard, intentional FastAPI dependency-injection
-pattern, not a bug.
+I also had it correct a couple of smaller things along the way:
+`app.on_event("startup")` (deprecated in current FastAPI) got rewritten as a
+`lifespan` context manager, and I had `ruff`'s `B008` rule (which flags
+`Depends(...)` as an argument default) explicitly silenced in `pyproject.toml`
+since that's the standard, intentional FastAPI dependency-injection pattern, not a
+bug.
 
 ## What I'd Examine First With Two More Hours
 
 - Property-based tests (Hypothesis) for the discount rounding function across a
   much wider space of `(subtotal, percent)` pairs than the three hand-picked edge
-  cases currently covered.
+  cases I currently cover.
 - Load-test the concurrency endpoints at higher parallelism (50-100 concurrent
   requests rather than 5-10) to see where SQLite's single-writer serialization
   starts to show up as request latency rather than just correctness.
@@ -283,9 +285,10 @@ pattern, not a bug.
 
 ## Time Spent
 
-Built in a single focused session: roughly 45 minutes on schema/models/config,
-90 minutes on the checkout transaction and services layer (including finding and
-fixing the idempotency-key race), 45 minutes on coupons/report, 45 minutes writing
-the test suite (unit + integration + concurrency), 60 minutes on the frontend, and
-30 minutes manually exercising the full app in a browser against the live backend
-(which is where both real bugs above were actually found), plus this document.
+I spent a single focused working session on this: roughly 45 minutes directing
+and reviewing schema/models/config, 90 minutes on the checkout transaction and
+services layer (including tracking down and directing the fix for the
+idempotency-key race), 45 minutes on coupons/report, 45 minutes on the test suite
+(unit + integration + concurrency), 60 minutes on the frontend, and 30 minutes
+manually testing the full app in a browser against the live backend myself — which
+is where I actually found both bugs documented above — plus writing this document.
