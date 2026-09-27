@@ -1,5 +1,7 @@
 # Reliable Checkout & Rewards Service
 
+![CI](https://github.com/Aditya-tec/uniblox-test/actions/workflows/ci.yml/badge.svg)
+
 A small e-commerce checkout API (FastAPI + SQLite) plus a React frontend, built around
 correctness under concurrency: no overselling, no double-spent coupons, no duplicate
 orders from a retried checkout, and no double-issued milestone rewards.
